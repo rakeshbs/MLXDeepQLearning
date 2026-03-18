@@ -12,54 +12,56 @@ FPS = 60
 PIXEL_OBS_SIZE = 84
 PIXEL_OBS_STACK = 4
 
-PADDLE_WIDTH = 88
+PADDLE_WIDTH = 72
 PADDLE_HEIGHT = 14
-PADDLE_Y = SCREEN_HEIGHT - 40
+PADDLE_Y = SCREEN_HEIGHT - 36
 PADDLE_SPEED = 8
 
 BALL_SIZE = 10
 BALL_SPEED = 5.0
-BALL_SPEEDUP = 1.02
-MAX_BALL_SPEED = 9.0
+BALL_SPEEDUP = 1.015
+MAX_BALL_SPEED = 8.0
+MAX_STEPS = 20_000  # safety cap; not part of the original Atari rules
 
 BRICK_ROWS = 6
-BRICK_COLS = 10
-BRICK_HEIGHT = 20
-BRICK_GAP = 4
-BRICK_TOP = 60
-BRICK_MARGIN_X = 0
-MAX_STEPS = 5_000
-
+BRICK_COLS = 18
+BRICK_HEIGHT = 18
+BRICK_TOP = 58
+BRICK_VALUES = [7, 7, 4, 4, 1, 1]
 BRICK_COLORS = [
-    (239, 83, 80),
-    (255, 167, 38),
-    (255, 238, 88),
-    (102, 187, 106),
-    (66, 165, 245),
-    (171, 71, 188),
+    (220, 72, 72),   # red
+    (242, 127, 42),  # orange
+    (241, 196, 15),  # yellow
+    (90, 190, 90),   # green
+    (79, 195, 247),  # aqua
+    (66, 133, 244),  # blue
 ]
+
+MAX_LIVES = 5
+MAX_WALLS = 2
+MAX_SCORE = BRICK_COLS * sum(BRICK_VALUES) * MAX_WALLS  # 864
+
+ACTION_NOOP = 0
+ACTION_FIRE = 1
+ACTION_RIGHT = 2
+ACTION_LEFT = 3
 
 
 class BreakoutEnv(BaseEnv):
     """
-    Single-player Breakout environment.
+    Atari-inspired Breakout environment using the original scoring structure.
 
-    obs_type:
-        "state"  — 6-dim float vector:
-                   (ball_x, ball_y, ball_vx, ball_vy, paddle_x, bricks_remaining)
-        "pixels" — 4 stacked 84x84 grayscale frames, shape (4, 84, 84)
+    Modeled after standard one-player Atari Breakout rules:
+      - 5 lives
+      - 2 walls total per game
+      - reward equals score delta from bricks only
+      - actions: NOOP, FIRE, RIGHT, LEFT
 
-    action space: 0 = stay, 1 = move left, 2 = move right
-
-    Rewards:
-        +1 for each brick destroyed
-        -1 when the ball is lost
-        +10 when the board is cleared
-
-    Episode ends when the ball is lost, all bricks are cleared, or max_steps is reached.
+    This is not a ROM-accurate emulator, but the rules and point system track
+    the Atari manual and ALE Breakout documentation closely.
     """
 
-    action_dim = 3
+    action_dim = 4
 
     def __init__(self, render_mode: bool = False, obs_type: str = "state"):
         self.render_mode = render_mode
@@ -87,21 +89,19 @@ class BreakoutEnv(BaseEnv):
             self.obs_shape = (PIXEL_OBS_STACK, PIXEL_OBS_SIZE, PIXEL_OBS_SIZE)
             self._frame_stack = np.zeros(self.obs_shape, dtype=np.float32)
         else:
-            self.obs_shape = (6,)
-
-        self.brick_width = (
-            SCREEN_WIDTH - 2 * BRICK_MARGIN_X - (BRICK_COLS - 1) * BRICK_GAP
-        ) / BRICK_COLS
-        self.total_bricks = BRICK_ROWS * BRICK_COLS
+            self.obs_shape = (8,)
 
         self.paddle_x = 0.0
         self.ball_x = 0.0
         self.ball_y = 0.0
         self.ball_vx = 0.0
         self.ball_vy = 0.0
+        self.ball_attached = True
         self.bricks = []
         self.score = 0
         self.steps = 0
+        self.lives = MAX_LIVES
+        self.walls_cleared = 0
 
         self.reset()
 
@@ -109,8 +109,10 @@ class BreakoutEnv(BaseEnv):
         self.paddle_x = (SCREEN_WIDTH - PADDLE_WIDTH) / 2
         self.score = 0
         self.steps = 0
-        self.bricks = self._build_bricks()
-        self._reset_ball(launch_upward=True)
+        self.lives = MAX_LIVES
+        self.walls_cleared = 0
+        self.bricks = self._build_wall()
+        self._attach_ball()
 
         if self.obs_type == "pixels":
             self._frame_stack = np.zeros(self.obs_shape, dtype=np.float32)
@@ -124,22 +126,54 @@ class BreakoutEnv(BaseEnv):
     def step(self, action: int) -> tuple[np.ndarray, float, bool, dict]:
         self.steps += 1
 
-        if action == 1:
+        if action == ACTION_LEFT:
             self.paddle_x -= PADDLE_SPEED
-        elif action == 2:
+        elif action == ACTION_RIGHT:
             self.paddle_x += PADDLE_SPEED
         self.paddle_x = float(np.clip(self.paddle_x, 0, SCREEN_WIDTH - PADDLE_WIDTH))
 
         reward = 0.0
         done = False
 
-        steps = max(
+        if self.ball_attached:
+            self._attach_ball()
+            if action == ACTION_FIRE:
+                self._launch_ball()
+        else:
+            reward, done = self._advance_ball()
+
+        if self.steps >= MAX_STEPS:
+            done = True
+
+        if self.render_mode:
+            self.render()
+        elif self.obs_type == "pixels":
+            self._draw_frame()
+
+        if self.obs_type == "pixels":
+            frame = self._capture_frame()
+            self._frame_stack = np.roll(self._frame_stack, shift=-1, axis=0)
+            self._frame_stack[-1] = frame
+
+        info = {
+            "score": self.score,
+            "lives": self.lives,
+            "walls_cleared": self.walls_cleared,
+            "max_score": MAX_SCORE,
+        }
+        return self._get_obs(), reward, done, info
+
+    def _advance_ball(self) -> tuple[float, bool]:
+        reward = 0.0
+        done = False
+
+        substeps = max(
             1, int(np.ceil(max(abs(self.ball_vx), abs(self.ball_vy)) / BALL_SIZE))
         )
-        sub_vx = self.ball_vx / steps
-        sub_vy = self.ball_vy / steps
+        sub_vx = self.ball_vx / substeps
+        sub_vy = self.ball_vy / substeps
 
-        for _ in range(steps):
+        for _ in range(substeps):
             prev_x = self.ball_x
             prev_y = self.ball_y
             self.ball_x += sub_vx
@@ -159,10 +193,8 @@ class BreakoutEnv(BaseEnv):
                 self.ball_vy = abs(self.ball_vy)
                 sub_vy = abs(sub_vy)
 
-            paddle_rect = pygame.Rect(
-                self.paddle_x, PADDLE_Y, PADDLE_WIDTH, PADDLE_HEIGHT
-            )
-            ball_rect = pygame.Rect(self.ball_x, self.ball_y, BALL_SIZE, BALL_SIZE)
+            paddle_rect = pygame.Rect(int(self.paddle_x), PADDLE_Y, PADDLE_WIDTH, PADDLE_HEIGHT)
+            ball_rect = pygame.Rect(int(self.ball_x), int(self.ball_y), BALL_SIZE, BALL_SIZE)
 
             if ball_rect.colliderect(paddle_rect) and self.ball_vy > 0:
                 self.ball_y = PADDLE_Y - BALL_SIZE - 1
@@ -170,12 +202,13 @@ class BreakoutEnv(BaseEnv):
                 hit_pos = (
                     (self.ball_x + BALL_SIZE / 2) - (self.paddle_x + PADDLE_WIDTH / 2)
                 ) / (PADDLE_WIDTH / 2)
-                self.ball_vx += float(hit_pos * 2.2)
+                hit_pos = float(np.clip(hit_pos, -1.0, 1.0))
+                self.ball_vx = hit_pos * (MAX_BALL_SPEED * 0.8)
                 self._speed_up_ball()
                 self._clamp_ball_speed(min_vertical_speed=3.0)
-                sub_vx = self.ball_vx / steps
-                sub_vy = self.ball_vy / steps
-                ball_rect = pygame.Rect(self.ball_x, self.ball_y, BALL_SIZE, BALL_SIZE)
+                sub_vx = self.ball_vx / substeps
+                sub_vy = self.ball_vy / substeps
+                ball_rect = pygame.Rect(int(self.ball_x), int(self.ball_y), BALL_SIZE, BALL_SIZE)
 
             brick_hit = None
             for brick in self.bricks:
@@ -196,79 +229,74 @@ class BreakoutEnv(BaseEnv):
                             self.ball_x = brick_rect.left - BALL_SIZE - 1
                         else:
                             self.ball_x = brick_rect.right + 1
-                        sub_vx = self.ball_vx / steps
+                        sub_vx = self.ball_vx / substeps
                     else:
                         self.ball_vy = -self.ball_vy
                         if overlap_top < overlap_bottom:
                             self.ball_y = brick_rect.top - BALL_SIZE - 1
                         else:
                             self.ball_y = brick_rect.bottom + 1
-                        sub_vy = self.ball_vy / steps
+                        sub_vy = self.ball_vy / substeps
                     break
 
             if brick_hit is not None:
                 self.bricks.remove(brick_hit)
-                self.score += 1
-                reward += 1.0
+                self.score += brick_hit["value"]
+                reward += float(brick_hit["value"])
                 self._speed_up_ball()
                 self._clamp_ball_speed(min_vertical_speed=2.5)
-                sub_vx = self.ball_vx / steps
-                sub_vy = self.ball_vy / steps
+                sub_vx = self.ball_vx / substeps
+                sub_vy = self.ball_vy / substeps
 
-            if not self.bricks:
-                reward += 10.0
-                done = True
-                break
+                if not self.bricks:
+                    self.walls_cleared += 1
+                    if self.walls_cleared >= MAX_WALLS:
+                        done = True
+                    else:
+                        self.bricks = self._build_wall()
+                    break
 
             if self.ball_y > SCREEN_HEIGHT:
-                reward -= 1.0
-                done = True
+                self.lives -= 1
+                if self.lives <= 0:
+                    done = True
+                else:
+                    self._attach_ball()
                 break
 
-        if self.steps >= MAX_STEPS:
-            done = True
+        return reward, done
 
-        if self.render_mode:
-            self.render()
-        elif self.obs_type == "pixels":
-            self._draw_frame()
-
-        if self.obs_type == "pixels":
-            frame = self._capture_frame()
-            self._frame_stack = np.roll(self._frame_stack, shift=-1, axis=0)
-            self._frame_stack[-1] = frame
-
-        return self._get_obs(), reward, done, {"score": self.score}
-
-    def _build_bricks(self) -> list[dict]:
+    def _build_wall(self) -> list[dict]:
         bricks = []
-        for row in range(BRICK_ROWS):
-            color = BRICK_COLORS[row % len(BRICK_COLORS)]
+        for row, value in enumerate(BRICK_VALUES):
+            color = BRICK_COLORS[row]
+            top = BRICK_TOP + row * BRICK_HEIGHT
+            bottom = top + BRICK_HEIGHT
             for col in range(BRICK_COLS):
-                x = BRICK_MARGIN_X + col * (self.brick_width + BRICK_GAP)
-                y = BRICK_TOP + row * (BRICK_HEIGHT + BRICK_GAP)
+                left = round(col * SCREEN_WIDTH / BRICK_COLS)
+                right = round((col + 1) * SCREEN_WIDTH / BRICK_COLS)
                 bricks.append(
                     {
-                        "rect": pygame.Rect(
-                            int(round(x)),
-                            int(round(y)),
-                            int(round(self.brick_width)),
-                            BRICK_HEIGHT,
-                        ),
+                        "rect": pygame.Rect(left, top, right - left, bottom - top),
                         "color": color,
+                        "value": value,
                     }
                 )
         return bricks
 
-    def _reset_ball(self, launch_upward: bool = False) -> None:
+    def _attach_ball(self) -> None:
+        self.ball_attached = True
         self.ball_x = self.paddle_x + PADDLE_WIDTH / 2 - BALL_SIZE / 2
         self.ball_y = PADDLE_Y - BALL_SIZE - 4
-        angle = random.uniform(35, 65) * random.choice([-1, 1])
+        self.ball_vx = 0.0
+        self.ball_vy = 0.0
+
+    def _launch_ball(self) -> None:
+        self.ball_attached = False
+        angle = random.uniform(28, 55) * random.choice([-1, 1])
         rad = np.deg2rad(angle)
         self.ball_vx = BALL_SPEED * np.sin(rad)
         self.ball_vy = -BALL_SPEED * np.cos(rad)
-        if not launch_upward and self.ball_vy > 0:
-            self.ball_vy = -self.ball_vy
 
     def _clamp_ball_speed(self, min_vertical_speed: float = 0.0) -> None:
         speed = np.sqrt(self.ball_vx**2 + self.ball_vy**2)
@@ -307,7 +335,9 @@ class BreakoutEnv(BaseEnv):
                 self.ball_vx / MAX_BALL_SPEED,
                 self.ball_vy / MAX_BALL_SPEED,
                 (self.paddle_x + PADDLE_WIDTH / 2) / SCREEN_WIDTH,
-                len(self.bricks) / self.total_bricks,
+                len(self.bricks) / (BRICK_ROWS * BRICK_COLS),
+                self.lives / MAX_LIVES,
+                float(self.ball_attached),
             ],
             dtype=np.float32,
         )
@@ -317,12 +347,10 @@ class BreakoutEnv(BaseEnv):
             return
         pygame.event.pump()
 
-        self.screen.fill((14, 20, 30))
+        self.screen.fill((8, 12, 22))
 
         for brick in self.bricks:
-            pygame.draw.rect(
-                self.screen, brick["color"], brick["rect"], border_radius=3
-            )
+            pygame.draw.rect(self.screen, brick["color"], brick["rect"])
 
         pygame.draw.rect(
             self.screen,
@@ -336,11 +364,20 @@ class BreakoutEnv(BaseEnv):
             (int(self.ball_x), int(self.ball_y), BALL_SIZE, BALL_SIZE),
         )
 
-        font = pygame.font.SysFont(None, 32)
-        score_text = font.render(f"Score: {self.score}", True, (230, 230, 230))
-        bricks_text = font.render(f"Bricks: {len(self.bricks)}", True, (180, 200, 220))
-        self.screen.blit(score_text, (16, 14))
-        self.screen.blit(bricks_text, (SCREEN_WIDTH - bricks_text.get_width() - 16, 14))
+        font = pygame.font.SysFont(None, 28)
+        score_text = font.render(f"Score: {self.score}", True, (235, 235, 235))
+        lives_text = font.render(f"Lives: {self.lives}", True, (210, 220, 235))
+        walls_text = font.render(f"Walls: {self.walls_cleared}/{MAX_WALLS}", True, (210, 220, 235))
+        self.screen.blit(score_text, (10, 14))
+        self.screen.blit(lives_text, (SCREEN_WIDTH // 2 - lives_text.get_width() // 2, 14))
+        self.screen.blit(walls_text, (SCREEN_WIDTH - walls_text.get_width() - 10, 14))
+
+        if self.ball_attached:
+            serve_text = font.render("Press Space to Serve", True, (255, 220, 130))
+            self.screen.blit(
+                serve_text,
+                (SCREEN_WIDTH // 2 - serve_text.get_width() // 2, PADDLE_Y - 42),
+            )
 
     def _capture_frame(self) -> np.ndarray:
         raw = pygame.surfarray.array3d(self.screen)
