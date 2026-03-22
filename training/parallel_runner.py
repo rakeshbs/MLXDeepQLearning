@@ -1,4 +1,5 @@
 import multiprocessing as mp
+import os
 import random
 import resource
 import threading
@@ -9,8 +10,12 @@ import mlx.core as mx
 import numpy as np
 
 from algorithms.buffers import PrioritizedReplayBuffer, ReplayBuffer
-from training.checkpoint import Checkpointer
+from training.checkpoint import Checkpointer, install_process_logger
 from training.runner import RunnerConfig
+
+_BOOT_LOG_PATH = os.environ.get("MLX_RL_LOG_PATH")
+if _BOOT_LOG_PATH:
+    install_process_logger(_BOOT_LOG_PATH)
 
 
 def _ape_x_epsilons(num_actors: int, base: float = 0.4, alpha: float = 7.0) -> list:
@@ -37,9 +42,11 @@ def _actor_fn(
     weight_queue,
     transition_queue,
     epsilon: float,
-    train_start: int,
+    random_warmup_steps: int,
     env_kwargs: dict,
     initial_weights: dict,
+    ckpt_dir: str,
+    skip_random_warmup: bool = False,
 ):
     """
     Runs in a child process. Each actor has its own independent MLX Metal context.
@@ -61,10 +68,12 @@ def _actor_fn(
     # Metal GPU context, which is why 'spawn' (not 'fork') is required.
     import mlx.core as mx
 
+    Checkpointer(ckpt_dir).install_process_logger()
+
     algo = algo_factory()
     algo.set_weights(initial_weights)
     env = env_factory(**env_kwargs)
-    total_steps = 0
+    total_steps = random_warmup_steps if skip_random_warmup else 0
 
     while True:
         # Drain weight_queue before each episode — only keep the most recent
@@ -85,8 +94,8 @@ def _actor_fn(
 
         state = env.reset()
         while True:
-            # Epsilon-greedy: random action during warm-up or with prob epsilon
-            if random.random() < epsilon or total_steps < train_start:
+            # Epsilon-greedy: random action during actor warm-up or with prob epsilon
+            if random.random() < epsilon or total_steps < random_warmup_steps:
                 action = random.randint(0, env.action_dim - 1)
             else:
                 action = algo.select_action(state)
@@ -101,19 +110,12 @@ def _actor_fn(
             score = info.get("score") if done else None
             transition = (state, action, float(reward), next_state, bool(done), score)
             if done:
-                # Terminal transitions carry episode score — block until the learner
-                # drains the queue rather than silently dropping them.  A brief block
-                # here is acceptable (once per episode) and is far less harmful than
-                # losing all score signals (which prevents any logging or checkpointing).
                 try:
                     transition_queue.put(transition, timeout=5.0)
                 except Exception:
                     pass  # learner appears dead; keep actor alive
             else:
                 try:
-                    # put_nowait: never block — drop the transition if the queue is full.
-                    # A blocked actor would stall its episode loop, which is worse than
-                    # occasionally losing a non-terminal transition.
                     transition_queue.put_nowait(transition)
                 except Exception:
                     pass  # queue full — drop transition, never block
@@ -179,6 +181,12 @@ class ParallelRunner:
         per_beta: float = 0.4,
         epsilon_base_decay: float = 1.0,  # multiply epsilon_base by this each weight sync
         epsilon_base_min: float = 0.01,  # floor for epsilon_base after decay
+        lr_decay: float = 1.0,  # multiply current lr by this each weight sync
+        lr_min: float = 1e-5,  # floor for lr after decay
+        per_beta_increment: float = 0.0,  # add this to beta each weight sync (anneals toward 1.0)
+        actor_random_warmup_steps: Optional[
+            int
+        ] = None,  # None -> fall back to cfg.train_start
     ):
         self.env_factory = env_factory
         self.algo = algo
@@ -195,9 +203,17 @@ class ParallelRunner:
         self.per_beta = per_beta
         self.epsilon_base_decay = epsilon_base_decay
         self.epsilon_base_min = epsilon_base_min
+        self.lr_decay = lr_decay
+        self.lr_min = lr_min
+        self.per_beta_increment = per_beta_increment
+        self.actor_random_warmup_steps = actor_random_warmup_steps
         self.checkpointer = Checkpointer(config.ckpt_dir)
 
     def train(self):
+        self.checkpointer.install_process_logger()
+        self._train_impl()
+
+    def _train_impl(self):
         """
         Launch actor processes and run the learner loop.
 
@@ -217,6 +233,11 @@ class ParallelRunner:
         resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, 8192), hard))
 
         cfg = self.config
+        actor_random_warmup_steps = (
+            cfg.train_start
+            if self.actor_random_warmup_steps is None
+            else max(0, int(self.actor_random_warmup_steps))
+        )
 
         # Restore learner state from disk if a previous run was checkpointed
         meta = self.checkpointer.load(self.algo)
@@ -225,6 +246,14 @@ class ParallelRunner:
             total_steps = meta["total_steps"]
             best_score = meta.get("best_score", -1)
             best_avg100 = meta.get("best_avg100")
+            # Clamp restored epsilon to the current configured floor so older
+            # checkpoints cannot resume below the experiment's minimum.
+            current_epsilon_base = max(
+                self.epsilon_base_min,
+                meta.get("epsilon_base", self.epsilon_base),
+            )
+            current_lr = meta.get("current_lr", self.algo.config.lr)
+            current_beta = meta.get("current_beta", self.per_beta)
             best_avg100_text = (
                 f"{best_avg100:.2f}" if best_avg100 is not None else "n/a"
             )
@@ -232,21 +261,26 @@ class ParallelRunner:
                 f"Resuming from checkpoint — "
                 f"episode={start_ep}  "
                 f"total_steps={total_steps}  "
-                f"peak_score={best_score}  best_avg100={best_avg100_text}"
+                f"peak_score={best_score}  best_avg100={best_avg100_text}  "
+                f"epsilon_base={current_epsilon_base:.4f}  "
+                f"lr={current_lr:.2e}  per_beta={current_beta:.4f}"
             )
+            # Restore lr into the freshly-created optimizer (Adam state is not saved)
+            self.algo.set_lr(current_lr)
         else:
             print("No checkpoint found — starting fresh.")
             start_ep = 1
             total_steps = 0
             best_score = -1
             best_avg100 = None
-
-        # Compute the initial per-actor epsilon spread using the Ape-X formula
-        current_epsilon_base = self.epsilon_base
+            current_epsilon_base = self.epsilon_base
+            current_lr = self.algo.config.lr
+            current_beta = self.per_beta
         actor_epsilons = _ape_x_epsilons(
             self.num_actors, current_epsilon_base, self.epsilon_alpha
         )
         print("Actor epsilons: " + "  ".join(f"{e:.4f}" for e in actor_epsilons))
+        print(f"Actor random warmup steps: {actor_random_warmup_steps}")
 
         buffer = PrioritizedReplayBuffer(
             cfg.buffer_size, alpha=self.per_alpha, beta=self.per_beta
@@ -254,6 +288,17 @@ class ParallelRunner:
         print(
             f"Using PrioritizedReplayBuffer (alpha={self.per_alpha}, beta={self.per_beta})"
         )
+
+        buffer.beta = (
+            current_beta  # restore annealed beta (or initial value on fresh start)
+        )
+        t0 = time.time()
+        if buffer.load(cfg.ckpt_dir):
+            print(
+                f"Restored {len(buffer):,} transitions from replay buffer in {time.time() - t0:.1f}s."
+            )
+        else:
+            print("No replay buffer checkpoint found — starting with empty buffer.")
 
         # 'spawn' context creates fresh interpreter per process — required for MLX
         # because Metal GPU contexts cannot be safely inherited by forked processes.
@@ -263,6 +308,9 @@ class ParallelRunner:
         weight_queues = [ctx.Queue(maxsize=2) for _ in range(self.num_actors)]
         # Large enough to buffer bursts from all actors without dropping too many transitions
         transition_queue = ctx.Queue(maxsize=self.num_actors * 2_000)
+
+        previous_boot_log_path = os.environ.get("MLX_RL_LOG_PATH")
+        os.environ["MLX_RL_LOG_PATH"] = self.checkpointer.log_path
 
         actors = []
         initial_weights = self.algo.get_weights()
@@ -277,9 +325,11 @@ class ParallelRunner:
                     weight_queues[i],
                     transition_queue,
                     actor_epsilons[i],
-                    cfg.train_start,
+                    actor_random_warmup_steps,
                     self.env_kwargs,
                     initial_weights,
+                    cfg.ckpt_dir,
+                    bool(meta),  # skip_random_warmup — use policy immediately on resume
                 ),
                 daemon=True,  # actors die automatically if the learner exits
             )
@@ -291,6 +341,10 @@ class ParallelRunner:
         learner_updates = 0
         episode = start_ep
         recent_scores: list = []  # rolling window (last 100) for mean score display
+        is_best_score = False
+        eval_states = None  # fixed set of states for Q-value diagnostics
+        _recent_losses: list = []  # losses accumulated since last weight sync
+        _recent_td_errors: list = []  # mean TD errors accumulated since last weight sync
 
         # Heartbeat: prints debug state every 10s so we can see where it's stuck
         # without the overhead of printing every iteration of the tight inner loop.
@@ -330,7 +384,8 @@ class ParallelRunner:
                             # Track peak score separately from the checkpoint
                             # criterion, which is the rolling Avg100 once the
                             # window is fully populated.
-                            if score > best_score:
+                            is_best_score = score > best_score
+                            if is_best_score:
                                 best_score = score
 
                             recent_scores.append(score)
@@ -371,8 +426,12 @@ class ParallelRunner:
                                     "best_avg100": round(best_avg100, 4)
                                     if best_avg100 is not None
                                     else None,
+                                    "epsilon_base": round(current_epsilon_base, 6),
+                                    "current_lr": round(current_lr, 8),
+                                    "current_beta": round(current_beta, 6),
                                 },
                                 is_best=is_best,
+                                is_best_score=is_best_score,
                             )
                             episode += 1
                             _dbg["last_ep"] = episode
@@ -381,18 +440,24 @@ class ParallelRunner:
                     except Exception:
                         break  # queue is empty — stop draining
 
-                # Train the learner — run multiple gradient steps per drain cycle
-                # so learning keeps pace with the actors' data production rate.
                 if len(buffer) >= cfg.train_start:
                     _dbg["phase"] = "update"
+
+                    # Sample a fixed eval set once for Q-value diagnostics
+                    if eval_states is None:
+                        eval_batch, _, _ = buffer.sample(1000)
+                        eval_states = eval_batch[0].copy()  # states only
+
                     for _ in range(self.updates_per_drain):
                         batch, tree_indices, is_weights = buffer.sample(cfg.batch_size)
-                        _, td_errors = self.algo.update(batch, weights=is_weights)
+                        loss, td_errors = self.algo.update(batch, weights=is_weights)
                         # Feed the fresh TD errors back into PER so priorities
                         # reflect the current network's surprisal, not stale values.
                         buffer.update_priorities(tree_indices, td_errors)
                         learner_updates += 1
                         _dbg["updates"] = learner_updates
+                        _recent_losses.append(loss)
+                        _recent_td_errors.append(float(np.mean(td_errors)))
 
                     # Periodically push latest weights (and decayed epsilons) to actors
                     if learner_updates % self.weight_sync_freq == 0:
@@ -403,6 +468,16 @@ class ParallelRunner:
                             self.epsilon_base_min,
                             current_epsilon_base * self.epsilon_base_decay,
                         )
+                        # Decay learning rate toward lr_min.
+                        if self.lr_decay < 1.0:
+                            current_lr = max(self.lr_min, current_lr * self.lr_decay)
+                            self.algo.set_lr(current_lr)
+                        # Anneal PER beta toward 1.0 for full IS correction.
+                        if self.per_beta_increment > 0.0:
+                            current_beta = min(
+                                1.0, current_beta + self.per_beta_increment
+                            )
+                            buffer.beta = current_beta
                         actor_epsilons = _ape_x_epsilons(
                             self.num_actors, current_epsilon_base, self.epsilon_alpha
                         )
@@ -422,6 +497,27 @@ class ParallelRunner:
                             except Exception:
                                 pass  # actor queue full — skip this sync cycle
 
+                        # Q-value diagnostics — log mean Q, target Q, gap, loss, TD error
+                        if eval_states is not None:
+                            qs = self.algo.q_stats(eval_states)
+                            mean_loss = (
+                                np.mean(_recent_losses) if _recent_losses else 0.0
+                            )
+                            mean_td = (
+                                np.mean(_recent_td_errors) if _recent_td_errors else 0.0
+                            )
+                            print(
+                                f"[Q] upd={learner_updates}  "
+                                f"q_online={qs['mean_q_online']:7.3f}  "
+                                f"q_target={qs['mean_q_target']:7.3f}  "
+                                f"gap={qs['q_gap']:+7.3f}  "
+                                f"loss={mean_loss:.4f}  "
+                                f"td={mean_td:.4f}  "
+                                f"eps={current_epsilon_base:.4f}"
+                            )
+                            _recent_losses.clear()
+                            _recent_td_errors.clear()
+
                     # Release GPU memory pool periodically to avoid fragmentation
                     if learner_updates % 50 == 0:
                         _dbg["phase"] = "clear_cache"
@@ -434,18 +530,36 @@ class ParallelRunner:
         except KeyboardInterrupt:
             print("\nStopped by user. Latest checkpoint is saved.")
         finally:
-            # Signal heartbeat thread to stop, then clean up all child processes and queues
+            if previous_boot_log_path is None:
+                os.environ.pop("MLX_RL_LOG_PATH", None)
+            else:
+                os.environ["MLX_RL_LOG_PATH"] = previous_boot_log_path
             _stop_hb.set()
             for p in actors:
                 p.terminate()
+            # join with timeout — p.join() can itself raise KeyboardInterrupt when
+            # actors die noisily; we don't want that to abort the buffer save.
             for p in actors:
-                p.join()
-            # join_thread() flushes the queue's background feeder thread before closing
-            transition_queue.close()
-            transition_queue.join_thread()
+                try:
+                    p.join(timeout=2)
+                except Exception:
+                    pass
+            try:
+                transition_queue.cancel_join_thread()
+                transition_queue.close()
+            except Exception:
+                pass
             for wq in weight_queues:
-                wq.close()
-                wq.join_thread()
+                try:
+                    wq.cancel_join_thread()
+                    wq.close()
+                except Exception:
+                    pass
+
+            print(f"Saving replay buffer ({len(buffer):,} transitions)...")
+            t0 = time.time()
+            buffer.save(cfg.ckpt_dir)
+            print(f"Replay buffer saved in {time.time() - t0:.1f}s.")
 
         best_avg100_text = f"{best_avg100:.2f}" if best_avg100 is not None else "n/a"
         print(
@@ -453,14 +567,45 @@ class ParallelRunner:
             f"BestAvg100: {best_avg100_text}"
         )
 
-    def test(self, best: bool = False):
-        """
-        Run the greedy policy with rendering in a single process until KeyboardInterrupt.
+    def test(
+        self,
+        best: bool = False,
+        best_score: bool = False,
+        env_kwargs_override: Optional[Dict[str, Any]] = None,
+        num_episodes: int = 0,
+        render: bool = True,
+    ):
+        self.checkpointer.install_process_logger()
+        self._test_impl(
+            best=best,
+            best_score=best_score,
+            env_kwargs_override=env_kwargs_override,
+            num_episodes=num_episodes,
+            render=render,
+        )
 
-        No actors are spawned — inference runs directly in the learner process
-        so the display is accessible. Epsilon is 0 (always greedy).
+    def _test_impl(
+        self,
+        best: bool = False,
+        best_score: bool = False,
+        env_kwargs_override: Optional[Dict[str, Any]] = None,
+        num_episodes: int = 0,
+        render: bool = True,
+    ):
         """
-        if best:
+        Run the greedy policy in a single process.
+
+        No actors are spawned — inference runs directly in the learner process.
+        Epsilon is 0 (always greedy).
+
+        Args:
+            num_episodes: Stop after this many episodes. 0 = run until Ctrl+C.
+            render: Whether to render visually. Set False for fast batch evaluation.
+        """
+        if best_score:
+            meta = self.checkpointer.load_best_score(self.algo)
+            tag = "best_score"
+        elif best:
             meta = self.checkpointer.load_best(self.algo)
             tag = "best"
         else:
@@ -478,18 +623,36 @@ class ParallelRunner:
             f"peak_score: {meta.get('best_score', 'n/a')}"
         )
 
+        test_kwargs = {**self.env_kwargs, **(env_kwargs_override or {})}
+
+        scores = []
         episode = 0
         try:
             while True:
-                env = self.env_factory(render_mode=True, **self.env_kwargs)
+                env = self.env_factory(render_mode=render, **test_kwargs)
                 state = env.reset()
                 episode += 1
                 while True:
                     action = self.algo.select_action(state)
                     state, _, done, info = env.step(action)
                     if done:
-                        print(f"Episode {episode} — Score: {info['score']}")
+                        score = info["score"]
+                        scores.append(score)
+                        print(f"Episode {episode} — Score: {score}")
                         break
                 env.close()
+                if num_episodes > 0 and episode >= num_episodes:
+                    break
         except KeyboardInterrupt:
             pass
+
+        if len(scores) > 1:
+            arr = np.array(scores)
+            print(
+                f"\n--- Results over {len(arr)} episodes ---"
+                f"\n  Mean:   {arr.mean():.1f}"
+                f"\n  Std:    {arr.std():.1f}"
+                f"\n  Median: {np.median(arr):.1f}"
+                f"\n  Min:    {arr.min()}"
+                f"\n  Max:    {arr.max()}"
+            )

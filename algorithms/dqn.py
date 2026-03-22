@@ -73,6 +73,9 @@ class CNNQNetwork(nn.Module):
 
     def __call__(self, x):
         # x arrives as (B, C, H, W); MLX Conv2d expects (B, H, W, C)
+        # Normalise uint8 observations [0, 255] → float32 [0, 1] here so the
+        # buffer can store raw uint8 pixels at 4× lower memory cost.
+        x = x.astype(mx.float32) * (1.0 / 255.0)
         x = mx.transpose(x, (0, 2, 3, 1))
         x = nn.relu(self.conv1(x))
         x = nn.relu(self.conv2(x))
@@ -101,11 +104,15 @@ def _loss_fn(model, states, actions, targets, weights):
     # Index into Q-values with the action taken: shape (batch,)
     q_selected = q[mx.arange(len(actions)), actions]
     td = q_selected - targets
-    # stop_gradient on abs_td so the absolute error is computed for PER
-    # priority updates but does NOT contribute to parameter gradients —
-    # only the weighted squared loss drives learning.
-    abs_td = mx.stop_gradient(mx.abs(td))
-    return mx.mean(weights * td ** 2), abs_td
+    # Compute Huber loss with correct gradients in both regions:
+    #   |td| <= 1: 0.5 * td^2  → gradient = td
+    #   |td|  > 1: |td| - 0.5  → gradient = sign(td)
+    # abs_td must NOT have stop_gradient here — the linear region needs
+    # gradients to flow through abs(td). A separate stop_gradient copy is
+    # returned for PER priority updates, which must not affect the loss gradient.
+    abs_td = mx.abs(td)
+    huber = mx.where(abs_td <= 1.0, 0.5 * td ** 2, abs_td - 0.5)
+    return mx.mean(weights * huber), mx.stop_gradient(abs_td)
 
 
 class DQN(BaseAlgorithm):
@@ -154,6 +161,7 @@ class DQN(BaseAlgorithm):
         targets = self._compute_targets(r, ns, d)
         # loss_and_grad returns ((loss, abs_td_errors), gradients) in one pass
         (loss, td_errors), grads = self.loss_and_grad(self.online, s, a, targets, w)
+        grads, _ = optim.clip_grad_norm(grads, max_norm=10.0)
         self.optimizer.update(self.online, grads)
         # CRITICAL: optimizer.state must be included in mx.eval(). Adam maintains
         # moment arrays (m, v) as lazy MLX computations. If they are never eval'd,
@@ -165,6 +173,27 @@ class DQN(BaseAlgorithm):
         if self._update_count % self.config.target_update_freq == 0:
             self._sync_hard()
         return loss.item(), np.array(td_errors)
+
+    def q_stats(self, states: np.ndarray) -> dict:
+        """
+        Compute Q-value diagnostics on a fixed evaluation set.
+
+        Returns mean max-Q for online and target networks and their gap.
+        A steadily rising mean_q_online with flat/falling performance indicates
+        overestimation. A large gap between online and target indicates the
+        target is lagging behind a drifting online network.
+        """
+        s = mx.array(states)
+        q_online = self.online(s)
+        q_target = self.target(s)
+        mx.eval(q_online, q_target)
+        mean_q_online = float(mx.mean(mx.max(q_online, axis=1)).item())
+        mean_q_target = float(mx.mean(mx.max(q_target, axis=1)).item())
+        return {
+            "mean_q_online": mean_q_online,
+            "mean_q_target": mean_q_target,
+            "q_gap": mean_q_online - mean_q_target,
+        }
 
     def _compute_targets(self, rewards, next_states, dones):
         """
@@ -191,6 +220,9 @@ class DQN(BaseAlgorithm):
         """
         self.target.update(self.online.parameters())
         mx.eval(self.target.parameters())
+
+    def set_lr(self, lr: float) -> None:
+        self.optimizer.learning_rate = lr
 
     def get_weights(self) -> dict:
         # tree_flatten converts the nested parameter dict into a flat (key, array) list

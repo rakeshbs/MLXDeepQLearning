@@ -1,3 +1,4 @@
+import os
 import random
 from collections import deque
 
@@ -27,10 +28,10 @@ class ReplayBuffer:
         batch = random.sample(self.buf, batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
         return (
-            np.array(states,      dtype=np.float32),
+            np.array(states),                        # preserves stored dtype (uint8 or float32)
             np.array(actions,     dtype=np.int32),
             np.array(rewards,     dtype=np.float32),
-            np.array(next_states, dtype=np.float32),
+            np.array(next_states),                   # preserves stored dtype (uint8 or float32)
             np.array(dones,       dtype=np.float32),
         )
 
@@ -198,10 +199,10 @@ class PrioritizedReplayBuffer:
         states, actions, rewards, next_states, dones = zip(*batch)
         return (
             (
-                np.array(states,      dtype=np.float32),
+                np.array(states),                        # preserves stored dtype (uint8 or float32)
                 np.array(actions,     dtype=np.int32),
                 np.array(rewards,     dtype=np.float32),
-                np.array(next_states, dtype=np.float32),
+                np.array(next_states),                   # preserves stored dtype (uint8 or float32)
                 np.array(dones,       dtype=np.float32),
             ),
             tree_indices,
@@ -211,11 +212,84 @@ class PrioritizedReplayBuffer:
     def update_priorities(self, tree_indices: np.ndarray, td_errors: np.ndarray):
         # Recompute priority = (|td_error| + epsilon)^alpha and push into the tree.
         # epsilon prevents zero-priority (which would make a transition unreachable).
-        priorities = (np.abs(td_errors) + self.epsilon) ** self.alpha
-        for idx, priority in zip(tree_indices, priorities):
+        # _max_priority tracks the raw (pre-alpha) maximum so that push can correctly
+        # compute max_raw^alpha for new transitions. Storing alpha-raised values here
+        # and then raising again in push would double-apply alpha.
+        raw = np.abs(td_errors) + self.epsilon
+        priorities = raw ** self.alpha
+        for idx, priority, r in zip(tree_indices, priorities, raw):
             self._tree.update(int(idx), float(priority))
-            # Track the running max so new transitions start at the highest known priority
-            self._max_priority = max(self._max_priority, float(priority))
+            # Track raw max so push uses max_raw^alpha (not max_raw^alpha^alpha)
+            self._max_priority = max(self._max_priority, float(r))
+
+    def save(self, ckpt_dir: str) -> None:
+        """
+        Save buffer state to <ckpt_dir>/replay_buffer.npz atomically.
+
+        Writes to replay_buffer_tmp.npz first, then renames so a crash
+        mid-save never corrupts the previous good file. Valid data is always
+        in slots 0.._size-1 (the circular write pointer is saved separately
+        so the exact slot layout is restored on load).
+        """
+        final = os.path.join(ckpt_dir, "replay_buffer.npz")
+        tmp   = os.path.join(ckpt_dir, "replay_buffer_tmp.npz")
+
+        n = self._size
+        items = self._data[:n]
+        states      = np.array([x[0] for x in items])
+        actions     = np.array([x[1] for x in items], dtype=np.int32)
+        rewards     = np.array([x[2] for x in items], dtype=np.float32)
+        next_states = np.array([x[3] for x in items])
+        dones       = np.array([x[4] for x in items], dtype=np.float32)
+
+        np.savez(
+            tmp,
+            states=states,
+            actions=actions,
+            rewards=rewards,
+            next_states=next_states,
+            dones=dones,
+            tree=self._tree.tree,
+            write=np.array(self._write),
+            size=np.array(n),
+            max_priority=np.array(self._max_priority),
+        )
+        os.replace(tmp, final)
+
+    def load(self, ckpt_dir: str) -> bool:
+        """
+        Restore buffer state from <ckpt_dir>/replay_buffer.npz.
+        Returns True on success, False if no file or load failed.
+        """
+        path = os.path.join(ckpt_dir, "replay_buffer.npz")
+        if not os.path.exists(path):
+            return False
+        try:
+            f = np.load(path, allow_pickle=False)
+            n           = int(f["size"])
+            states      = f["states"]
+            actions     = f["actions"]
+            rewards     = f["rewards"]
+            next_states = f["next_states"]
+            dones       = f["dones"]
+
+            for i in range(n):
+                self._data[i] = (
+                    states[i],
+                    int(actions[i]),
+                    float(rewards[i]),
+                    next_states[i],
+                    float(dones[i]),
+                )
+
+            self._tree.tree[:]  = f["tree"]
+            self._write         = int(f["write"])
+            self._size          = n
+            self._max_priority  = float(f["max_priority"])
+            return True
+        except Exception as e:
+            print(f"Warning: failed to load replay buffer ({e}). Starting with empty buffer.")
+            return False
 
     def __len__(self) -> int:
         return self._size

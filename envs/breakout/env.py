@@ -29,10 +29,10 @@ BRICK_HEIGHT = 18
 BRICK_TOP = 58
 BRICK_VALUES = [7, 7, 4, 4, 1, 1]
 BRICK_COLORS = [
-    (220, 72, 72),   # red
+    (220, 72, 72),  # red
     (242, 127, 42),  # orange
     (241, 196, 15),  # yellow
-    (90, 190, 90),   # green
+    (90, 190, 90),  # green
     (79, 195, 247),  # aqua
     (66, 133, 244),  # blue
 ]
@@ -63,9 +63,17 @@ class BreakoutEnv(BaseEnv):
 
     action_dim = 4
 
-    def __init__(self, render_mode: bool = False, obs_type: str = "state"):
+    def __init__(
+        self,
+        render_mode: bool = False,
+        obs_type: str = "state",
+        frame_skip: int = 4,
+        terminal_on_life_loss: bool = True,
+    ):
         self.render_mode = render_mode
         self.obs_type = obs_type
+        self.frame_skip = frame_skip
+        self.terminal_on_life_loss = terminal_on_life_loss
         self.screen_width = SCREEN_WIDTH
         self.screen_height = SCREEN_HEIGHT
 
@@ -87,7 +95,7 @@ class BreakoutEnv(BaseEnv):
 
         if obs_type == "pixels":
             self.obs_shape = (PIXEL_OBS_STACK, PIXEL_OBS_SIZE, PIXEL_OBS_SIZE)
-            self._frame_stack = np.zeros(self.obs_shape, dtype=np.float32)
+            self._frame_stack = np.zeros(self.obs_shape, dtype=np.uint8)
         else:
             self.obs_shape = (8,)
 
@@ -102,6 +110,7 @@ class BreakoutEnv(BaseEnv):
         self.steps = 0
         self.lives = MAX_LIVES
         self.walls_cleared = 0
+        self._idle_steps = 0
 
         self.reset()
 
@@ -111,11 +120,12 @@ class BreakoutEnv(BaseEnv):
         self.steps = 0
         self.lives = MAX_LIVES
         self.walls_cleared = 0
+        self._idle_steps = 0
         self.bricks = self._build_wall()
         self._attach_ball()
 
         if self.obs_type == "pixels":
-            self._frame_stack = np.zeros(self.obs_shape, dtype=np.float32)
+            self._frame_stack = np.zeros(self.obs_shape, dtype=np.uint8)
             self._draw_frame()
             frame = self._capture_frame()
             for i in range(PIXEL_OBS_STACK):
@@ -124,26 +134,35 @@ class BreakoutEnv(BaseEnv):
         return self._get_obs()
 
     def step(self, action: int) -> tuple[np.ndarray, float, bool, dict]:
-        self.steps += 1
-
-        if action == ACTION_LEFT:
-            self.paddle_x -= PADDLE_SPEED
-        elif action == ACTION_RIGHT:
-            self.paddle_x += PADDLE_SPEED
-        self.paddle_x = float(np.clip(self.paddle_x, 0, SCREEN_WIDTH - PADDLE_WIDTH))
-
-        reward = 0.0
+        total_reward = 0.0
         done = False
 
-        if self.ball_attached:
-            self._attach_ball()
-            if action == ACTION_FIRE:
-                self._launch_ball()
-        else:
-            reward, done = self._advance_ball()
+        for _ in range(self.frame_skip):
+            self.steps += 1
 
-        if self.steps >= MAX_STEPS:
-            done = True
+            if action == ACTION_LEFT:
+                self.paddle_x -= PADDLE_SPEED
+            elif action == ACTION_RIGHT:
+                self.paddle_x += PADDLE_SPEED
+            self.paddle_x = float(
+                np.clip(self.paddle_x, 0, SCREEN_WIDTH - PADDLE_WIDTH)
+            )
+
+            if self.ball_attached:
+                self._attach_ball()
+                self._idle_steps += 1
+                if action == ACTION_FIRE or self._idle_steps >= 18:
+                    self._launch_ball()
+                    self._idle_steps = 0
+            else:
+                reward, done = self._advance_ball()
+                total_reward += reward
+
+            if self.steps >= MAX_STEPS:
+                done = True
+
+            if done:
+                break
 
         if self.render_mode:
             self.render()
@@ -161,7 +180,7 @@ class BreakoutEnv(BaseEnv):
             "walls_cleared": self.walls_cleared,
             "max_score": MAX_SCORE,
         }
-        return self._get_obs(), reward, done, info
+        return self._get_obs(), total_reward, done, info
 
     def _advance_ball(self) -> tuple[float, bool]:
         reward = 0.0
@@ -193,8 +212,12 @@ class BreakoutEnv(BaseEnv):
                 self.ball_vy = abs(self.ball_vy)
                 sub_vy = abs(sub_vy)
 
-            paddle_rect = pygame.Rect(int(self.paddle_x), PADDLE_Y, PADDLE_WIDTH, PADDLE_HEIGHT)
-            ball_rect = pygame.Rect(int(self.ball_x), int(self.ball_y), BALL_SIZE, BALL_SIZE)
+            paddle_rect = pygame.Rect(
+                int(self.paddle_x), PADDLE_Y, PADDLE_WIDTH, PADDLE_HEIGHT
+            )
+            ball_rect = pygame.Rect(
+                int(self.ball_x), int(self.ball_y), BALL_SIZE, BALL_SIZE
+            )
 
             if ball_rect.colliderect(paddle_rect) and self.ball_vy > 0:
                 self.ball_y = PADDLE_Y - BALL_SIZE - 1
@@ -208,36 +231,34 @@ class BreakoutEnv(BaseEnv):
                 self._clamp_ball_speed(min_vertical_speed=3.0)
                 sub_vx = self.ball_vx / substeps
                 sub_vy = self.ball_vy / substeps
-                ball_rect = pygame.Rect(int(self.ball_x), int(self.ball_y), BALL_SIZE, BALL_SIZE)
 
+            step_dx = self.ball_x - prev_x
+            step_dy = self.ball_y - prev_y
+            brick_collision = self._find_brick_collision(
+                prev_x, prev_y, step_dx, step_dy
+            )
             brick_hit = None
-            for brick in self.bricks:
-                brick_rect = brick["rect"]
-                if ball_rect.colliderect(brick_rect):
-                    brick_hit = brick
-                    overlap_left = ball_rect.right - brick_rect.left
-                    overlap_right = brick_rect.right - ball_rect.left
-                    overlap_top = ball_rect.bottom - brick_rect.top
-                    overlap_bottom = brick_rect.bottom - ball_rect.top
-                    min_overlap = min(
-                        overlap_left, overlap_right, overlap_top, overlap_bottom
-                    )
+            if brick_collision is not None:
+                brick_hit, collision_axis = brick_collision
+                brick_rect = brick_hit["rect"]
+                move_x = step_dx if abs(step_dx) > 1e-9 else self.ball_vx
+                move_y = step_dy if abs(step_dy) > 1e-9 else self.ball_vy
 
-                    if min_overlap in (overlap_left, overlap_right):
-                        self.ball_vx = -self.ball_vx
-                        if overlap_left < overlap_right:
-                            self.ball_x = brick_rect.left - BALL_SIZE - 1
-                        else:
-                            self.ball_x = brick_rect.right + 1
-                        sub_vx = self.ball_vx / substeps
+                if collision_axis in ("x", "corner"):
+                    self.ball_vx = -self.ball_vx
+                    if move_x > 0:
+                        self.ball_x = brick_rect.left - BALL_SIZE - 1
                     else:
-                        self.ball_vy = -self.ball_vy
-                        if overlap_top < overlap_bottom:
-                            self.ball_y = brick_rect.top - BALL_SIZE - 1
-                        else:
-                            self.ball_y = brick_rect.bottom + 1
-                        sub_vy = self.ball_vy / substeps
-                    break
+                        self.ball_x = brick_rect.right + 1
+                    sub_vx = self.ball_vx / substeps
+
+                if collision_axis in ("y", "corner"):
+                    self.ball_vy = -self.ball_vy
+                    if move_y > 0:
+                        self.ball_y = brick_rect.top - BALL_SIZE - 1
+                    else:
+                        self.ball_y = brick_rect.bottom + 1
+                    sub_vy = self.ball_vy / substeps
 
             if brick_hit is not None:
                 self.bricks.remove(brick_hit)
@@ -254,17 +275,88 @@ class BreakoutEnv(BaseEnv):
                         done = True
                     else:
                         self.bricks = self._build_wall()
+                        self._attach_ball()
                     break
 
             if self.ball_y > SCREEN_HEIGHT:
                 self.lives -= 1
-                if self.lives <= 0:
+                if self.terminal_on_life_loss:
+                    done = True  # DeepMind trick: each life is its own episode
+                elif self.lives <= 0:
                     done = True
-                else:
-                    self._attach_ball()
+                if done:
+                    break
+                self._attach_ball()
                 break
 
         return reward, done
+
+    @staticmethod
+    def _axis_entry_exit(
+        start: float, delta: float, lower: float, upper: float
+    ) -> tuple[float, float]:
+        if delta > 0:
+            return (lower - start) / delta, (upper - start) / delta
+        if delta < 0:
+            return (upper - start) / delta, (lower - start) / delta
+        if lower <= start <= upper:
+            return -float("inf"), float("inf")
+        return float("inf"), -float("inf")
+
+    def _sweep_ball_against_rect(
+        self, prev_x: float, prev_y: float, dx: float, dy: float, rect: pygame.Rect
+    ) -> tuple[float, str, float] | None:
+        x_entry, x_exit = self._axis_entry_exit(
+            prev_x, dx, rect.left - BALL_SIZE, rect.right
+        )
+        y_entry, y_exit = self._axis_entry_exit(
+            prev_y, dy, rect.top - BALL_SIZE, rect.bottom
+        )
+
+        entry_time = max(x_entry, y_entry)
+        exit_time = min(x_exit, y_exit)
+        if (
+            entry_time > exit_time
+            or exit_time < 0.0
+            or entry_time > 1.0
+            or entry_time < 0.0
+        ):
+            return None
+
+        if abs(x_entry - y_entry) <= 1e-9:
+            axis = "corner"
+        elif x_entry > y_entry:
+            axis = "x"
+        else:
+            axis = "y"
+
+        impact_center_x = prev_x + dx * entry_time + BALL_SIZE / 2
+        impact_center_y = prev_y + dy * entry_time + BALL_SIZE / 2
+        center_dist_sq = (impact_center_x - rect.centerx) ** 2 + (
+            impact_center_y - rect.centery
+        ) ** 2
+        return entry_time, axis, center_dist_sq
+
+    def _find_brick_collision(
+        self, prev_x: float, prev_y: float, dx: float, dy: float
+    ) -> tuple[dict, str] | None:
+        best_collision = None
+        best_key = None
+
+        for brick in self.bricks:
+            collision = self._sweep_ball_against_rect(
+                prev_x, prev_y, dx, dy, brick["rect"]
+            )
+            if collision is None:
+                continue
+
+            entry_time, axis, center_dist_sq = collision
+            key = (entry_time, center_dist_sq, brick["rect"].top, brick["rect"].left)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_collision = (brick, axis)
+
+        return best_collision
 
     def _build_wall(self) -> list[dict]:
         bricks = []
@@ -367,17 +459,14 @@ class BreakoutEnv(BaseEnv):
         font = pygame.font.SysFont(None, 28)
         score_text = font.render(f"Score: {self.score}", True, (235, 235, 235))
         lives_text = font.render(f"Lives: {self.lives}", True, (210, 220, 235))
-        walls_text = font.render(f"Walls: {self.walls_cleared}/{MAX_WALLS}", True, (210, 220, 235))
+        walls_text = font.render(
+            f"Walls: {self.walls_cleared}/{MAX_WALLS}", True, (210, 220, 235)
+        )
         self.screen.blit(score_text, (10, 14))
-        self.screen.blit(lives_text, (SCREEN_WIDTH // 2 - lives_text.get_width() // 2, 14))
+        self.screen.blit(
+            lives_text, (SCREEN_WIDTH // 2 - lives_text.get_width() // 2, 14)
+        )
         self.screen.blit(walls_text, (SCREEN_WIDTH - walls_text.get_width() - 10, 14))
-
-        if self.ball_attached:
-            serve_text = font.render("Press Space to Serve", True, (255, 220, 130))
-            self.screen.blit(
-                serve_text,
-                (SCREEN_WIDTH // 2 - serve_text.get_width() // 2, PADDLE_Y - 42),
-            )
 
     def _capture_frame(self) -> np.ndarray:
         raw = pygame.surfarray.array3d(self.screen)
@@ -388,7 +477,7 @@ class BreakoutEnv(BaseEnv):
         row_idx = (np.arange(th) * h // th).astype(np.int32)
         col_idx = (np.arange(tw) * w // tw).astype(np.int32)
         resized = gray[np.ix_(row_idx, col_idx)]
-        return (resized / 255.0).astype(np.float32)
+        return resized.astype(np.uint8)
 
     def render(self) -> None:
         if not self.render_mode:

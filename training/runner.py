@@ -14,12 +14,12 @@ from training.checkpoint import Checkpointer
 class RunnerConfig:
     buffer_size: int = 50_000
     batch_size: int = 64
-    train_start: int = 1_000       # steps before learning begins (pure exploration)
+    train_start: int = 1_000  # steps before learning begins (pure exploration)
     max_episodes: int = 2_000
     epsilon_start: float = 1.0
     epsilon_end: float = 0.001
-    epsilon_decay: float = 0.999   # multiplied every episode (geometric decay)
-    render_every: int = 200        # render one episode every N episodes
+    epsilon_decay: float = 0.999  # multiplied every episode (geometric decay)
+    render_every: int = 200  # render one episode every N episodes
     ckpt_dir: str = "checkpoints"
     log_every: int = 50
 
@@ -47,15 +47,19 @@ class Runner:
         reward_shaper: Optional[Callable] = None,
         env_kwargs: Optional[Dict[str, Any]] = None,
     ):
-        self.env_factory  = env_factory
-        self.algo         = algo
-        self.config       = config
+        self.env_factory = env_factory
+        self.algo = algo
+        self.config = config
         self.reward_shaper = reward_shaper
-        self.env_kwargs   = env_kwargs or {}
-        self.buffer       = ReplayBuffer(config.buffer_size)
+        self.env_kwargs = env_kwargs or {}
+        self.buffer = ReplayBuffer(config.buffer_size)
         self.checkpointer = Checkpointer(config.ckpt_dir)
 
     def train(self):
+        self.checkpointer.install_process_logger()
+        self._train_impl()
+
+    def _train_impl(self):
         """
         Main training loop. Runs for config.max_episodes episodes.
 
@@ -69,10 +73,10 @@ class Runner:
         # Try to restore previous training state from disk
         meta = self.checkpointer.load(self.algo)
         if meta:
-            start_ep    = meta["episode"] + 1
-            epsilon     = meta["epsilon"]
+            start_ep = meta["episode"] + 1
+            epsilon = meta["epsilon"]
             total_steps = meta["total_steps"]
-            best_score  = meta["best_score"]
+            best_score = meta["best_score"]
             print(
                 f"Resuming from checkpoint — "
                 f"episode={start_ep}  epsilon={epsilon:.4f}  "
@@ -80,17 +84,17 @@ class Runner:
             )
         else:
             print("No checkpoint found — starting fresh.")
-            start_ep    = 1
-            epsilon     = cfg.epsilon_start
+            start_ep = 1
+            epsilon = cfg.epsilon_start
             total_steps = 0
-            best_score  = -1
+            best_score = -1
 
         for episode in range(start_ep, start_ep + cfg.max_episodes):
             # Render every N-th episode so human oversight is possible without
             # paying the rendering overhead on every episode
             render = episode % cfg.render_every == 0
-            env    = self.env_factory(render_mode=render, **self.env_kwargs)
-            state  = env.reset()
+            env = self.env_factory(render_mode=render, **self.env_kwargs)
+            state = env.reset()
             episode_reward = 0.0
 
             while True:
@@ -107,9 +111,9 @@ class Runner:
                     reward = self.reward_shaper(env, reward, done)
 
                 self.buffer.push(state, action, reward, next_state, done)
-                state          = next_state
+                state = next_state
                 episode_reward += reward
-                total_steps    += 1
+                total_steps += 1
 
                 # Only start learning once the buffer has enough diverse experience
                 if len(self.buffer) >= cfg.train_start:
@@ -129,7 +133,7 @@ class Runner:
             # Geometric epsilon decay: explore less as training matures
             epsilon = max(cfg.epsilon_end, epsilon * cfg.epsilon_decay)
 
-            score   = info["score"]
+            score = info["score"]
             is_best = score > best_score
             if is_best:
                 best_score = score
@@ -158,6 +162,10 @@ class Runner:
         print(f"\nCycle complete. Best score: {best_score}")
 
     def test(self, best: bool = False):
+        self.checkpointer.install_process_logger()
+        self._test_impl(best)
+
+    def _test_impl(self, best: bool = False):
         """
         Run a checkpoint greedily with rendering until KeyboardInterrupt.
 
@@ -167,10 +175,10 @@ class Runner:
         """
         if best:
             meta = self.checkpointer.load_best(self.algo)
-            tag  = "best"
+            tag = "best"
         else:
             meta = self.checkpointer.load(self.algo)
-            tag  = "latest"
+            tag = "latest"
 
         if meta is None:
             print(f"No {tag} checkpoint found.")
@@ -185,7 +193,7 @@ class Runner:
         episode = 0
         try:
             while True:
-                env   = self.env_factory(render_mode=True, **self.env_kwargs)
+                env = self.env_factory(render_mode=True, **self.env_kwargs)
                 state = env.reset()
                 episode += 1
 
