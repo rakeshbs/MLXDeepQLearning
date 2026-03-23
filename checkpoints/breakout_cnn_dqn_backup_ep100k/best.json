@@ -1,0 +1,9 @@
+{
+  "episode": 77691,
+  "total_steps": 5404047,
+  "best_score": 815,
+  "best_avg100": 85.75,
+  "epsilon_base": 0.2,
+  "current_lr": 0.0001,
+  "current_beta": 1.0
+}

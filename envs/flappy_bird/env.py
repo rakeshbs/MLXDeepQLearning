@@ -9,7 +9,7 @@ from envs.base import BaseEnv
 SCREEN_WIDTH    = 512
 SCREEN_HEIGHT   = 512
 FPS             = 30
-PIXEL_OBS_SIZE  = 84   # each frame is resized to 84×84 (DeepMind Atari convention)
+PIXEL_OBS_SIZE  = 84   # each frame is resized to 84×84
 PIXEL_OBS_STACK = 4    # number of consecutive frames stacked into one observation
 
 
@@ -221,8 +221,7 @@ class FlappyBirdEnv(BaseEnv):
             self.bird_y + self.bird_height >= self.screen_height - self.base_height
             or self.bird_y < 0
         ):
-            done   = True
-            reward = -10
+            done = True
 
         for pipe in self.pipes:
             # Top pipe extends upward from pipe["top"] by pipe_height pixels
@@ -234,8 +233,7 @@ class FlappyBirdEnv(BaseEnv):
                 pipe["x"], pipe["bottom"], self.pipe_width, self.pipe_height
             )
             if bird_rect.colliderect(top_pipe_rect) or bird_rect.colliderect(bottom_pipe_rect):
-                done   = True
-                reward = -10
+                done = True
 
             # Score a point when the pipe's right edge passes the bird's left edge
             if not pipe["passed"] and pipe["x"] + self.pipe_width < self.bird_x:

@@ -43,7 +43,7 @@ class CNNQNetwork(nn.Module):
     """
     Conv stack followed by an MLP head.
 
-    Mirrors the DeepMind Atari architecture (Mnih et al., 2015).
+    Standard Atari CNN architecture.
     Expects input shape (batch, channels, height, width) — e.g. (B, 4, 84, 84).
     MLX Conv2d uses (B, H, W, C) internally, so the channel dimension is
     transposed at the start of the forward pass.

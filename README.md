@@ -10,7 +10,7 @@ Current training setup:
 - `DQN`
 - `DoubleDQN`
 - `Prioritized Experience Replay`
-- `ParallelRunner` with Ape-X style actor/learner layout
+- `ParallelRunner` with distributed actor/learner layout
 
 ## Requirements
 
@@ -43,10 +43,13 @@ envs/
   flappy_bird/
   breakout/
 experiments/
-  flappy_dqn.py
-  flappy_double_dqn.py
-  flappy_cnn_dqn.py
-  breakout_cnn_dqn.py
+  breakout/
+    cnn_dqn.py        ← Breakout pixel CNN experiment
+    notes.md          ← Training notes and lessons learned
+  flappy/
+    dqn.py            ← Flappy Bird state-vector DQN
+    double_dqn.py     ← Flappy Bird state-vector Double DQN
+    cnn_dqn.py        ← Flappy Bird pixel CNN experiment
 training/
   runner.py
   parallel_runner.py
@@ -90,51 +93,87 @@ Action space:
 
 ## Training Experiments
 
+### Breakout
+
+Train:
+
+```bash
+python -m experiments.breakout.cnn_dqn
+```
+
+Test latest checkpoint:
+
+```bash
+python -m experiments.breakout.cnn_dqn --test
+```
+
+Test best checkpoint (by Avg100):
+
+```bash
+python -m experiments.breakout.cnn_dqn --test --best
+```
+
+Test best single-episode score checkpoint:
+
+```bash
+python -m experiments.breakout.cnn_dqn --test --best-score
+```
+
+Test with full 5-life game (no terminal on life loss):
+
+```bash
+python -m experiments.breakout.cnn_dqn --test --best --full-game
+```
+
+Test with epsilon-greedy evaluation (e.g. ε=0.05):
+
+```bash
+python -m experiments.breakout.cnn_dqn --test --best --epsilon=0.05
+```
+
+Test without rendering (faster, for benchmarking):
+
+```bash
+python -m experiments.breakout.cnn_dqn --test --best --no-render
+```
+
+Run a fixed number of test episodes:
+
+```bash
+python -m experiments.breakout.cnn_dqn --test --best --episodes=100
+```
+
+Flags can be combined freely:
+
+```bash
+python -m experiments.breakout.cnn_dqn --test --best --full-game --no-render --episodes=100 --epsilon=0.05
+```
+
 ### Flappy Bird
 
 State-vector DQN:
 
 ```bash
-python -m experiments.flappy_dqn
+python -m experiments.flappy.dqn
+python -m experiments.flappy.dqn --test
+python -m experiments.flappy.dqn --test --best
 ```
 
-State-vector DoubleDQN:
+State-vector Double DQN:
 
 ```bash
-python -m experiments.flappy_double_dqn
+python -m experiments.flappy.double_dqn
+python -m experiments.flappy.double_dqn --test
+python -m experiments.flappy.double_dqn --test --best
 ```
 
-Pixel-based CNN experiment:
+Pixel-based CNN Double DQN:
 
 ```bash
-python -m experiments.flappy_cnn_dqn
+python -m experiments.flappy.cnn_dqn
+python -m experiments.flappy.cnn_dqn --test
+python -m experiments.flappy.cnn_dqn --test --best
 ```
-
-Note: despite the filename, `flappy_cnn_dqn.py` currently uses `DoubleDQN` with a CNN encoder.
-
-### Breakout
-
-Pixel-based CNN DQN:
-
-```bash
-python -m experiments.breakout_cnn_dqn
-```
-
-## Testing Saved Checkpoints
-
-Latest checkpoint:
-
-```bash
-python -m experiments.breakout_cnn_dqn --test
-```
-
-Best checkpoint:
-
-```bash
-python -m experiments.breakout_cnn_dqn --test --best
-```
-
-Equivalent `--test` / `--best` flags work for the Flappy Bird experiments as well.
 
 ## Manual Play
 

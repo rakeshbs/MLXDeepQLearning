@@ -20,7 +20,7 @@ if _BOOT_LOG_PATH:
 
 def _ape_x_epsilons(num_actors: int, base: float = 0.4, alpha: float = 7.0) -> list:
     """
-    Ape-X epsilon schedule: actor i gets ε_i = base ^ (1 + α * i / (N - 1)).
+    Distributed epsilon schedule: actor i gets ε_i = base ^ (1 + α * i / (N - 1)).
 
     This formula spreads actors across a wide exploration range in a single
     parameter (base). Actor 0 is the most exploratory (base^1 = base) and
@@ -61,7 +61,7 @@ def _actor_fn(
     Draining the queue before each episode ensures the actor uses the latest
     learner weights without blocking the episode loop mid-step.
 
-    epsilon starts at the Ape-X assigned value and is updated by the learner
+    epsilon starts at the assigned value and is updated by the learner
     via weight_queue messages, which are (weights_dict, new_epsilon) tuples.
     """
     # Import mlx inside the child process — each spawned process gets a fresh
@@ -132,7 +132,7 @@ def _actor_fn(
 
 class ParallelRunner:
     """
-    Ape-X style parallel training loop.
+    Distributed parallel training loop.
 
     Architecture:
       - N actor processes run inference-only loops, each with its own MLX
@@ -342,7 +342,15 @@ class ParallelRunner:
         episode = start_ep
         recent_scores: list = []  # rolling window (last 100) for mean score display
         is_best_score = False
-        eval_states = None  # fixed set of states for Q-value diagnostics
+
+        # fixed set of states for Q-value diagnostics — persisted across restarts
+        # so Q-value trends are comparable run-to-run on the same state distribution.
+        _eval_states_path = os.path.join(cfg.ckpt_dir, "eval_states.npy")
+        if os.path.exists(_eval_states_path):
+            eval_states = np.load(_eval_states_path)
+            print(f"Loaded eval states from {_eval_states_path}")
+        else:
+            eval_states = None
         _recent_losses: list = []  # losses accumulated since last weight sync
         _recent_td_errors: list = []  # mean TD errors accumulated since last weight sync
 
@@ -560,6 +568,9 @@ class ParallelRunner:
             t0 = time.time()
             buffer.save(cfg.ckpt_dir)
             print(f"Replay buffer saved in {time.time() - t0:.1f}s.")
+            if eval_states is not None:
+                np.save(_eval_states_path, eval_states)
+                print(f"Eval states saved to {_eval_states_path}")
 
         best_avg100_text = f"{best_avg100:.2f}" if best_avg100 is not None else "n/a"
         print(
@@ -574,6 +585,7 @@ class ParallelRunner:
         env_kwargs_override: Optional[Dict[str, Any]] = None,
         num_episodes: int = 0,
         render: bool = True,
+        epsilon: float = 0.0,
     ):
         self.checkpointer.install_process_logger()
         self._test_impl(
@@ -582,6 +594,7 @@ class ParallelRunner:
             env_kwargs_override=env_kwargs_override,
             num_episodes=num_episodes,
             render=render,
+            epsilon=epsilon,
         )
 
     def _test_impl(
@@ -591,16 +604,17 @@ class ParallelRunner:
         env_kwargs_override: Optional[Dict[str, Any]] = None,
         num_episodes: int = 0,
         render: bool = True,
+        epsilon: float = 0.0,
     ):
         """
-        Run the greedy policy in a single process.
+        Run the policy in a single process.
 
         No actors are spawned — inference runs directly in the learner process.
-        Epsilon is 0 (always greedy).
 
         Args:
             num_episodes: Stop after this many episodes. 0 = run until Ctrl+C.
             render: Whether to render visually. Set False for fast batch evaluation.
+            epsilon: Epsilon for action selection (0 = pure greedy, 0.05 = standard eval).
         """
         if best_score:
             meta = self.checkpointer.load_best_score(self.algo)
@@ -633,7 +647,10 @@ class ParallelRunner:
                 state = env.reset()
                 episode += 1
                 while True:
-                    action = self.algo.select_action(state)
+                    if epsilon > 0.0 and random.random() < epsilon:
+                        action = random.randrange(self.algo.config.action_dim)
+                    else:
+                        action = self.algo.select_action(state)
                     state, _, done, info = env.step(action)
                     if done:
                         score = info["score"]

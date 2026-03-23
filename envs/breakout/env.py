@@ -111,6 +111,7 @@ class BreakoutEnv(BaseEnv):
         self.lives = MAX_LIVES
         self.walls_cleared = 0
         self._idle_steps = 0
+        self.life_lost = False
 
         self.reset()
 
@@ -136,6 +137,7 @@ class BreakoutEnv(BaseEnv):
     def step(self, action: int) -> tuple[np.ndarray, float, bool, dict]:
         total_reward = 0.0
         done = False
+        self.life_lost = False
 
         for _ in range(self.frame_skip):
             self.steps += 1
@@ -280,8 +282,9 @@ class BreakoutEnv(BaseEnv):
 
             if self.ball_y > SCREEN_HEIGHT:
                 self.lives -= 1
+                self.life_lost = True
                 if self.terminal_on_life_loss:
-                    done = True  # DeepMind trick: each life is its own episode
+                    done = True  # each life is its own episode
                 elif self.lives <= 0:
                     done = True
                 if done:
