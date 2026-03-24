@@ -675,7 +675,8 @@ class ParallelRunner:
         episode = 0
         best_recorded_score = -1
         best_video_path = None
-        runs_dir = os.path.join(os.path.dirname(os.path.dirname(self.config.ckpt_dir)), "runs")
+        experiment_name = os.path.basename(os.path.normpath(self.config.ckpt_dir))
+        runs_dir = os.path.join(os.path.dirname(os.path.dirname(self.config.ckpt_dir)), "runs", experiment_name)
         os.makedirs(runs_dir, exist_ok=True)
         tmp_video_path = os.path.join(runs_dir, "_tmp_episode.mp4")
 
