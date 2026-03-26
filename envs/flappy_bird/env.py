@@ -78,7 +78,7 @@ class FlappyBirdEnv(BaseEnv):
         if obs_type == "pixels":
             # Channel-first layout (C, H, W) matches the CNN input convention
             self.obs_shape   = (PIXEL_OBS_STACK, PIXEL_OBS_SIZE, PIXEL_OBS_SIZE)
-            self._frame_stack = np.zeros(self.obs_shape, dtype=np.float32)
+            self._frame_stack = np.zeros(self.obs_shape, dtype=np.uint8)
         else:
             self.obs_shape = (5,)
 
@@ -143,7 +143,7 @@ class FlappyBirdEnv(BaseEnv):
         self.bird_anim_idx = 0
         self.base_x        = 0
         if self.obs_type == "pixels":
-            self._frame_stack = np.zeros(self.obs_shape, dtype=np.float32)
+            self._frame_stack = np.zeros(self.obs_shape, dtype=np.uint8)
             # Draw the initial frame once so the surface is populated, then
             # fill all 4 stack slots with the same frame. This avoids a
             # misleading all-black first observation for the first 3 steps.
@@ -283,7 +283,7 @@ class FlappyBirdEnv(BaseEnv):
         row_idx = (np.arange(th) * h // th).astype(np.int32)
         col_idx = (np.arange(tw) * w // tw).astype(np.int32)
         resized = gray[np.ix_(row_idx, col_idx)]
-        return (resized / 255.0).astype(np.float32)  # normalise to [0, 1]
+        return resized.astype(np.uint8)
 
     def _get_state(self) -> np.ndarray:
         """
