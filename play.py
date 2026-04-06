@@ -6,14 +6,13 @@ import pygame
 
 from envs.breakout import BreakoutEnv
 from envs.flappy_bird import FlappyBirdEnv
-from envs.snake import SnakeEnv
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Play an environment manually.")
     parser.add_argument(
         "--game",
-        choices=("breakout", "flappy", "snake"),
+        choices=("breakout", "flappy"),
         default="breakout",
         help="Which game to launch.",
     )
@@ -101,47 +100,10 @@ def play_flappy() -> None:
         env.close()
 
 
-def play_snake() -> None:
-    print("Snake controls: Arrow keys or WASD to steer, R to restart, Esc/Q to quit.")
-    env = SnakeEnv(render_mode=True)
-    env.reset()
-
-    try:
-        running = True
-        while running:
-            running, _, reset = _process_events()
-            if not running:
-                break
-            if reset:
-                env.reset()
-                continue
-
-            keys = pygame.key.get_pressed()
-            if keys[pygame.K_UP] or keys[pygame.K_w]:
-                action = 0
-            elif keys[pygame.K_DOWN] or keys[pygame.K_s]:
-                action = 1
-            elif keys[pygame.K_LEFT] or keys[pygame.K_a]:
-                action = 2
-            elif keys[pygame.K_RIGHT] or keys[pygame.K_d]:
-                action = 3
-            else:
-                action = env.direction  # keep going
-
-            _, _, done, info = env.step(action)
-            if done:
-                print(f"Game Over! Score: {info['score']}")
-                env.reset()
-    finally:
-        env.close()
-
-
 def main() -> None:
     args = parse_args()
     if args.game == "breakout":
         play_breakout()
-    elif args.game == "snake":
-        play_snake()
     else:
         play_flappy()
 
