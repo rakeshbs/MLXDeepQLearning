@@ -6,13 +6,14 @@ import pygame
 
 from envs.breakout import BreakoutEnv
 from envs.flappy_bird import FlappyBirdEnv
+from envs.pong import PongEnv
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Play an environment manually.")
     parser.add_argument(
         "--game",
-        choices=("breakout", "flappy"),
+        choices=("breakout", "flappy", "pong"),
         default="breakout",
         help="Which game to launch.",
     )
@@ -100,10 +101,53 @@ def play_flappy() -> None:
         env.close()
 
 
+def play_pong() -> None:
+    print("Pong controls: Up/Down arrows to move right paddle, R to restart, Esc/Q to quit.")
+    env = PongEnv(render_mode=True, score_limit=5)
+    env.reset()
+
+    try:
+        running = True
+        clock = pygame.time.Clock()
+        while running:
+            reset = False
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                        running = False
+                    elif event.key == pygame.K_r:
+                        reset = True
+
+            if not running:
+                break
+            if reset:
+                env.reset()
+                continue
+
+            keys = pygame.key.get_pressed()
+            if keys[pygame.K_UP]:
+                action = 1
+            elif keys[pygame.K_DOWN]:
+                action = 2
+            else:
+                action = 0
+
+            _, _, done, info = env.step(action)
+            if done:
+                print(f"Game Over! Right score: {info['score']}  Left score: {env.left_score}")
+                env.reset()
+    finally:
+        env.close()
+
+
 def main() -> None:
     args = parse_args()
     if args.game == "breakout":
         play_breakout()
+    elif args.game == "pong":
+        play_pong()
     else:
         play_flappy()
 
